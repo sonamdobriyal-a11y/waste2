@@ -1,64 +1,124 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="h-full">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Waste Volume Estimator (Web)</title>
-  <style>
-    body { font-family: system-ui, Arial, sans-serif; margin: 16px; }
-    .row { display: flex; gap: 16px; flex-wrap: wrap; }
-    video, img, canvas { max-width: 100%; border: 1px solid #ccc; border-radius: 6px; }
-    .panel { padding: 12px; border: 1px solid #ddd; border-radius: 8px; }
-    label { display: block; margin-bottom: 8px; }
-    input, select { width: 100%; padding: 6px 8px; margin-top: 4px; }
-    button { padding: 8px 12px; }
-  </style>
+  <title>Waste Volume Estimator</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+          },
+          colors: {
+            brand: {
+              50: '#eef2ff',
+              100: '#e0e7ff',
+              500: '#6366f1',
+              600: '#4f46e5',
+              700: '#4338ca',
+            },
+          },
+        },
+      },
+    };
+  </script>
   <script defer src="/static/app.js"></script>
   <script>
     window.APP_CONFIG = { processUrl: '/process' };
   </script>
-  </head>
-<body>
-  <h2>Waste Volume Estimator (Web)</h2>
-  <div class="row">
-    <div class="panel" style="flex:1; min-width: 280px;">
-      <h3>Camera</h3>
-      <video id="video" autoplay playsinline width="640" height="480"></video>
-      <canvas id="cap" width="640" height="480" style="display:none"></canvas>
-      <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
-        <label style="flex:1;">
-          Utensil
-          <select id="utensil">
-            <option value="auto">Auto</option>
-            <option value="plate">Plate</option>
-            <option value="bowl">Bowl</option>
-          </select>
-        </label>
-        <label style="flex:1;">
-          Diameter (mm)
-          <input id="diameter" type="number" placeholder="e.g., 260" />
-        </label>
-        <label style="flex:1;">
-          Height (mm)
-          <input id="height" type="number" value="15" />
-        </label>
+</head>
+<body class="h-full bg-slate-950 bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-slate-100 font-sans">
+  <div class="min-h-screen">
+    <header class="border-b border-white/10 bg-slate-900/70 backdrop-blur-md">
+      <div class="mx-auto flex max-w-7xl items-center justify-between px-6 py-5">
+        <div>
+          <p class="text-xs uppercase tracking-[0.4em] text-brand-100">Waste Intelligence</p>
+          <h1 class="mt-1 text-2xl font-semibold text-white">Waste Volume Estimator</h1>
+        </div>
+        <a href="/dashboard" class="inline-flex items-center gap-2 rounded-lg border border-brand-500/60 bg-brand-500/10 px-4 py-2 text-sm font-medium text-brand-100 transition hover:border-brand-500 hover:bg-brand-500/20 hover:text-white">
+          View Dashboard
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-4 w-4">
+            <path fill-rule="evenodd" d="M5 10a.75.75 0 0 1 .75-.75h6.19L9.72 7.03a.75.75 0 1 1 1.06-1.06l3.5 3.5a.75.75 0 0 1 0 1.06l-3.5 3.5a.75.75 0 0 1-1.06-1.06l2.22-2.22H5.75A.75.75 0 0 1 5 10Z" clip-rule="evenodd" />
+          </svg>
+        </a>
       </div>
-      <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
-        <label style="flex:1;">
-          Max FPS
-          <input id="fps" type="number" value="3" min="1" max="10" />
-        </label>
-        <button id="start">Start</button>
-        <button id="stop">Stop</button>
-      </div>
-    </div>
+    </header>
 
-    <div class="panel" style="flex:1; min-width: 280px;">
-      <h3>Server Overlay</h3>
-      <img id="overlay" alt="Overlay" width="640" height="480" />
-      <div id="stats" style="margin-top:8px;"></div>
-    </div>
+    <main class="mx-auto max-w-7xl px-6 pb-16 pt-12">
+      <div class="grid gap-8 lg:grid-cols-2">
+        <section class="rounded-3xl border border-white/10 bg-slate-900/60 p-6 shadow-xl ring-1 ring-white/5">
+          <div class="flex items-center justify-between">
+            <div>
+              <h2 class="text-lg font-semibold text-white">Camera Capture</h2>
+              <p class="mt-1 text-sm text-slate-300">Stream frames from your overhead camera and estimate fill levels in real time.</p>
+            </div>
+            <span class="inline-flex items-center gap-2 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-200">
+              <span class="h-2 w-2 rounded-full bg-emerald-400"></span>
+              Live
+            </span>
+          </div>
+
+          <div class="mt-6 overflow-hidden rounded-2xl border border-white/10 bg-black">
+            <div class="relative aspect-[4/3]">
+              <video id="video" autoplay playsinline class="absolute inset-0 h-full w-full rounded-2xl object-cover" width="640" height="480"></video>
+            </div>
+          </div>
+          <canvas id="cap" width="640" height="480" class="hidden"></canvas>
+
+          <div class="mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            <label class="flex flex-col space-y-1 text-sm">
+              <span class="text-slate-300">Utensil</span>
+              <select id="utensil" class="rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-slate-100 shadow-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/40">
+                <option value="auto">Auto</option>
+                <option value="plate">Plate</option>
+                <option value="bowl">Bowl</option>
+              </select>
+            </label>
+            <label class="flex flex-col space-y-1 text-sm">
+              <span class="text-slate-300">Diameter (mm)</span>
+              <input id="diameter" type="number" placeholder="e.g., 260" class="rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-slate-100 placeholder:text-slate-500 shadow-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/40" />
+            </label>
+            <label class="flex flex-col space-y-1 text-sm">
+              <span class="text-slate-300">Height (mm)</span>
+              <input id="height" type="number" value="15" class="rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-slate-100 shadow-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/40" />
+            </label>
+            <label class="flex flex-col space-y-1 text-sm">
+              <span class="text-slate-300">Max FPS</span>
+              <input id="fps" type="number" value="3" min="1" max="10" class="rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 text-slate-100 shadow-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/40" />
+            </label>
+            <div class="flex items-end gap-3 md:col-span-2 xl:col-span-1">
+              <button id="start" class="flex-1 rounded-xl border border-brand-500/60 bg-brand-500/20 px-4 py-2 text-sm font-semibold text-brand-100 transition hover:border-brand-500 hover:bg-brand-500/30 hover:text-white disabled:cursor-not-allowed disabled:opacity-50">Start</button>
+              <button id="stop" class="flex-1 rounded-xl border border-slate-700 bg-slate-800/70 px-4 py-2 text-sm font-semibold text-slate-300 transition hover:border-red-500/50 hover:bg-red-500/20 hover:text-red-100 disabled:cursor-not-allowed disabled:opacity-50">Stop</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="flex flex-col gap-6 rounded-3xl border border-white/10 bg-slate-900/60 p-6 shadow-xl ring-1 ring-white/5">
+          <div class="flex items-center justify-between">
+            <div>
+              <h2 class="text-lg font-semibold text-white">Server Overlay</h2>
+              <p class="mt-1 text-sm text-slate-300">Review the processed frame with segmentation overlays and annotated fill metrics.</p>
+            </div>
+            <span class="rounded-full bg-white/5 px-3 py-1 text-xs font-medium text-slate-300">Preview</span>
+          </div>
+
+          <div class="overflow-hidden rounded-2xl border border-white/10 bg-slate-950/60">
+            <div class="relative aspect-[4/3]">
+              <img id="overlay" alt="Overlay" class="absolute inset-0 h-full w-full rounded-2xl object-cover" width="640" height="480" />
+            </div>
+          </div>
+
+          <div id="stats" class="rounded-2xl border border-white/5 bg-white/5 px-4 py-3 text-sm font-medium text-slate-200 shadow-inner"></div>
+
+          <div class="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-100">
+            <span class="font-semibold">Tip:</span> Position the camera directly above the plate, keep lighting even, and confirm utensil dimensions for the best estimates.
+          </div>
+        </section>
+      </div>
+    </main>
   </div>
-  <p style="margin-top:12px; color:#666;">Tip: Point an overhead camera at a plate, set diameter (mm), and keep lighting even.</p>
 </body>
 </html>

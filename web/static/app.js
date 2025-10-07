@@ -13,32 +13,88 @@
   const startBtn = sel('#start');
   const stopBtn = sel('#stop');
 
+  stopBtn.disabled = true;
+  startBtn.disabled = false;
+
   const processUrl = (window.APP_CONFIG && window.APP_CONFIG.processUrl) || '/process';
 
   let running = false;
   let stream = null;
   let lastTick = 0;
 
+  function cleanupStream() {
+    if (!stream) return;
+    try {
+      stream.getTracks().forEach(track => track.stop());
+    } catch (err) {
+      console.warn('Failed to stop tracks', err);
+    }
+    stream = null;
+    try {
+      video.pause();
+    } catch (err) {
+      console.debug('video pause failed', err);
+    }
+    video.srcObject = null;
+  }
+
   async function start() {
     if (running) return;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
-      video.srcObject = stream;
-      await video.play();
-      running = true;
-      tick();
-    } catch (e) {
-      console.error(e);
-      alert('Camera access error: ' + e.message);
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      alert('Camera access is not supported in this browser. Try Chrome or Edge.');
+      return;
     }
+
+    cleanupStream();
+
+    const candidates = [
+      { video: { facingMode: 'environment' }, audio: false },
+      { video: { facingMode: 'user' }, audio: false },
+      { video: true, audio: false },
+    ];
+
+    let lastError = null;
+    for (const constraints of candidates) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        break;
+      } catch (err) {
+        lastError = err;
+        console.warn('getUserMedia failed for constraints', constraints, err);
+      }
+    }
+
+    if (!stream) {
+      cleanupStream();
+      console.error('Unable to open camera stream', lastError);
+      alert('Camera access error: ' + (lastError && (lastError.message || lastError.name) || 'unknown error'));
+      return;
+    }
+
+    video.srcObject = stream;
+    try {
+      await video.play();
+    } catch (playErr) {
+      console.error('Video playback failed', playErr);
+      alert('Unable to start video preview: ' + (playErr.message || playErr.name));
+      cleanupStream();
+      stop();
+      return;
+    }
+
+    running = true;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    tick();
   }
 
   function stop() {
     running = false;
-    if (stream) {
-      stream.getTracks().forEach(t => t.stop());
-      stream = null;
-    }
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    cleanupStream();
+    lastTick = 0;
   }
 
   async function tick(ts) {

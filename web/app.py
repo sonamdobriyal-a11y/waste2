@@ -1,82 +1,123 @@
 import base64
+import json
 import os
-import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 
 import cv2
+import firebase_admin
 import numpy as np
-from flask import Flask, jsonify, render_template, request
+from dotenv import load_dotenv
+from firebase_admin import credentials, firestore
+from google.api_core import exceptions as google_exceptions
+from queue import Empty, Queue
+from flask import Flask, jsonify, render_template, request, Response, stream_with_context
 
 # Ensure project root is importable (so we can import src.*)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
+
 from src.vision import detect_utensil_ellipse, segment_food_in_utensil, estimate_area_and_volume
 
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 
-DB_PATH = os.path.join(PROJECT_ROOT, 'utensil_sessions.db')
-_DB_LOCK = Lock()
-_DB_INIT = False
+FIREBASE_PROJECT_ID = os.environ.get('FIREBASE_PROJECT_ID')
+FIRESTORE_COLLECTION = 'utensil_sessions'
+_FIRESTORE_CLIENT = None
+_FIRESTORE_LOCK = Lock()
 
 
-def _init_db():
-    global _DB_INIT
-    with _DB_LOCK:
-        if _DB_INIT:
-            return
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS utensil_sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    utensil_type TEXT NOT NULL,
-                    average_volume_ml REAL,
-                    average_percent_fill REAL,
-                    sample_count INTEGER NOT NULL,
-                    started_at TEXT NOT NULL,
-                    ended_at TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            conn.commit()
-            _run_schema_migrations(conn)
-        _DB_INIT = True
+class FirestoreNotConfigured(RuntimeError):
+    """Raised when Firestore is unreachable or not initialised."""
+    pass
 
 
-def _write_session_to_db(session):
-    payload = (
-        session['utensil_type'],
-        session['average_volume_ml'],
-        session['average_percent_fill'],
-        session['sample_count'],
-        session['started_at'].isoformat(timespec='seconds') + 'Z',
-        session['ended_at'].isoformat(timespec='seconds') + 'Z',
-        datetime.utcnow().isoformat(timespec='seconds') + 'Z',
-    )
-    with _DB_LOCK:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                """
-                INSERT INTO utensil_sessions (
-                    utensil_type,
-                    average_volume_ml,
-                    average_percent_fill,
-                    sample_count,
-                    started_at,
-                    ended_at,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                payload,
-            )
-            conn.commit()
 
+def _build_firebase_credentials():
+    service_account_base64 = os.environ.get('FIREBASE_SERVICE_ACCOUNT_BASE64')
+    if service_account_base64:
+        service_account_base64 = service_account_base64.strip()
+    service_account_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT_JSON')
+    if service_account_json:
+        service_account_json = service_account_json.strip()
+    credentials_file = os.environ.get('FIREBASE_CREDENTIALS_FILE')
+    if credentials_file:
+        credentials_file = credentials_file.strip()
+
+    if service_account_base64:
+        try:
+            decoded = base64.b64decode(service_account_base64).decode('utf-8')
+        except Exception as exc:
+            raise RuntimeError('FIREBASE_SERVICE_ACCOUNT_BASE64 is not valid base64 data') from exc
+        service_account_json = decoded
+
+    if service_account_json:
+        try:
+            info = json.loads(service_account_json)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError('FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON') from exc
+        return credentials.Certificate(info)
+
+    if credentials_file:
+        credentials_path = credentials_file
+        if not os.path.isabs(credentials_path):
+            credentials_path = os.path.join(PROJECT_ROOT, credentials_path)
+        if not os.path.exists(credentials_path):
+            raise RuntimeError(f"FIREBASE_CREDENTIALS_FILE {credentials_path} does not exist")
+        return credentials.Certificate(credentials_path)
+
+    return None
+
+
+
+def _init_firestore():
+    global _FIRESTORE_CLIENT
+    if _FIRESTORE_CLIENT is not None:
+        return _FIRESTORE_CLIENT
+
+    with _FIRESTORE_LOCK:
+        if _FIRESTORE_CLIENT is not None:
+            return _FIRESTORE_CLIENT
+
+        if not firebase_admin._apps:
+            cred = _build_firebase_credentials()
+            options = {}
+            if FIREBASE_PROJECT_ID:
+                options['projectId'] = FIREBASE_PROJECT_ID
+            firebase_admin.initialize_app(credential=cred, options=options or None)
+
+        _FIRESTORE_CLIENT = firestore.client()
+    return _FIRESTORE_CLIENT
+
+
+class DashboardEventBroker:
+    """Tracks dashboard listeners and pushes events when sessions persist."""
+
+    def __init__(self):
+        self._lock = Lock()
+        self._subscribers = []
+
+    def subscribe(self):
+        queue = Queue()
+        with self._lock:
+            self._subscribers.append(queue)
+        return queue
+
+    def unsubscribe(self, queue):
+        with self._lock:
+            if queue in self._subscribers:
+                self._subscribers.remove(queue)
+
+    def publish(self, event):
+        with self._lock:
+            subscribers = list(self._subscribers)
+        for subscriber in subscribers:
+            subscriber.put(event)
 
 IST_TZ = timezone(timedelta(hours=5, minutes=30))
 UTC_TZ = timezone.utc
@@ -109,96 +150,110 @@ def _format_ts_for_display(value):
     return dt.astimezone(IST_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')
 
 
-def _run_schema_migrations(conn):
-    info = conn.execute("PRAGMA table_info(utensil_sessions)").fetchall()
-    if not info:
-        return
-    columns = {row[1]: row for row in info}
-    avg_volume_col = columns.get('average_volume_ml')
-    if avg_volume_col and avg_volume_col[3]:
+
+def _write_session_to_db(session):
+    client = _init_firestore()
+
+    started_at = _to_datetime_utc(session.get('started_at')) or datetime.utcnow().replace(tzinfo=UTC_TZ)
+    ended_at = _to_datetime_utc(session.get('ended_at')) or started_at
+    created_at = datetime.utcnow().replace(tzinfo=UTC_TZ)
+
+    avg_volume = session.get('average_volume_ml')
+    if avg_volume is not None:
         try:
-            conn.executescript(
-                """
-                BEGIN;
-                ALTER TABLE utensil_sessions RENAME TO utensil_sessions__old;
-                CREATE TABLE utensil_sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    utensil_type TEXT NOT NULL,
-                    average_volume_ml REAL,
-                    average_percent_fill REAL,
-                    sample_count INTEGER NOT NULL,
-                    started_at TEXT NOT NULL,
-                    ended_at TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                INSERT INTO utensil_sessions (
-                    id,
-                    utensil_type,
-                    average_volume_ml,
-                    average_percent_fill,
-                    sample_count,
-                    started_at,
-                    ended_at,
-                    created_at
-                )
-                SELECT
-                    id,
-                    utensil_type,
-                    average_volume_ml,
-                    average_percent_fill,
-                    sample_count,
-                    started_at,
-                    ended_at,
-                    created_at
-                FROM utensil_sessions__old;
-                DROP TABLE utensil_sessions__old;
-                COMMIT;
-                """
-            )
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            raise
+            avg_volume = float(avg_volume)
+        except (TypeError, ValueError):
+            avg_volume = None
+
+    avg_percent = session.get('average_percent_fill')
+    if avg_percent is not None:
+        try:
+            avg_percent = float(avg_percent)
+        except (TypeError, ValueError):
+            avg_percent = None
+
+    sample_count = session.get('sample_count') or 0
+    try:
+        sample_count = int(sample_count)
+    except (TypeError, ValueError):
+        sample_count = 0
+
+    payload = {
+        'utensil_type': session.get('utensil_type', 'unknown'),
+        'average_volume_ml': avg_volume,
+        'average_percent_fill': avg_percent,
+        'sample_count': sample_count,
+        'started_at': started_at,
+        'ended_at': ended_at,
+        'created_at': created_at,
+    }
+
+    collection = client.collection(FIRESTORE_COLLECTION)
+    doc_ref = collection.document()
+    try:
+        doc_ref.set(payload)
+    except google_exceptions.NotFound as exc:
+        raise FirestoreNotConfigured('Firestore database is not initialised for this project.') from exc
+    except google_exceptions.GoogleAPICallError as exc:
+        message = getattr(exc, 'message', str(exc))
+        raise FirestoreNotConfigured(f'Unable to write to Firestore: {message}') from exc
+    else:
+        DASHBOARD_EVENTS.publish({
+            'type': 'session_saved',
+            'id': doc_ref.id,
+            'created_at': created_at.isoformat(),
+        })
 
 
 def _fetch_recent_sessions(limit=200):
-    with _DB_LOCK:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """
-                SELECT
-                    id,
-                    utensil_type,
-                    average_volume_ml,
-                    average_percent_fill,
-                    sample_count,
-                    started_at,
-                    ended_at,
-                    created_at
-                FROM utensil_sessions
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+    client = _init_firestore()
+    query = (
+        client.collection(FIRESTORE_COLLECTION)
+        .order_by('created_at', direction=firestore.Query.DESCENDING)
+        .limit(limit)
+    )
     sessions = []
-    for row in rows:
-        avg_volume = float(row['average_volume_ml']) if row['average_volume_ml'] is not None else None
-        avg_percent = float(row['average_percent_fill']) if row['average_percent_fill'] is not None else None
+
+    try:
+        documents = list(query.stream())
+    except google_exceptions.NotFound as exc:
+        raise FirestoreNotConfigured('Firestore database is not initialised for this project.') from exc
+    except google_exceptions.GoogleAPICallError as exc:
+        message = getattr(exc, 'message', str(exc))
+        raise FirestoreNotConfigured(f'Unable to read from Firestore: {message}') from exc
+
+    for doc in documents:
+        data = doc.to_dict() or {}
+        avg_volume = data.get('average_volume_ml')
+        if avg_volume is not None:
+            try:
+                avg_volume = float(avg_volume)
+            except (TypeError, ValueError):
+                avg_volume = None
+        avg_percent = data.get('average_percent_fill')
+        if avg_percent is not None:
+            try:
+                avg_percent = float(avg_percent)
+            except (TypeError, ValueError):
+                avg_percent = None
+        sample_count = data.get('sample_count') or 0
+        try:
+            sample_count = int(sample_count)
+        except (TypeError, ValueError):
+            sample_count = 0
+
         sessions.append({
-            'id': row['id'],
-            'utensil_type': row['utensil_type'],
+            'id': doc.id,
+            'utensil_type': data.get('utensil_type', 'unknown'),
             'average_volume_ml': avg_volume,
             'average_percent_fill': avg_percent,
-            'sample_count': row['sample_count'],
-            'started_at': _format_ts_for_display(row['started_at']),
-            'ended_at': _format_ts_for_display(row['ended_at']),
-            'created_at': _format_ts_for_display(row['created_at']),
+            'sample_count': sample_count,
+            'started_at': _format_ts_for_display(data.get('started_at')),
+            'ended_at': _format_ts_for_display(data.get('ended_at')),
+            'created_at': _format_ts_for_display(data.get('created_at')),
         })
     return sessions
+
 
 
 def _dashboard_metrics(sessions):
@@ -301,12 +356,17 @@ class UtensilSessionTracker:
             'started_at': self.started_at or ended_at,
             'ended_at': self.last_seen_at or ended_at,
         }
-        _write_session_to_db(session)
+
+        try:
+            _write_session_to_db(session)
+        except FirestoreNotConfigured as exc:
+            app.logger.error('Failed to persist session to Firestore: %s', exc)
+
         self._clear_state()
         return session
 
 
-_init_db()
+DASHBOARD_EVENTS = DashboardEventBroker()
 SESSION_TRACKER = UtensilSessionTracker()
 
 
@@ -315,11 +375,34 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/dashboard/events')
+def dashboard_events():
+    queue = DASHBOARD_EVENTS.subscribe()
+
+    def generate():
+        try:
+            while True:
+                try:
+                    event = queue.get(timeout=30)
+                except Empty:
+                    yield ': keep-alive\n\n'
+                    continue
+                yield f"data: {json.dumps(event)}\n\n"
+        finally:
+            DASHBOARD_EVENTS.unsubscribe(queue)
+
+    response = Response(stream_with_context(generate()), mimetype='text/event-stream')
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    return response
+
+
 @app.route('/dashboard')
 def dashboard():
     sessions = _fetch_recent_sessions(limit=200)
     metrics = _dashboard_metrics(sessions)
     return render_template('dashboard.html', sessions=sessions, metrics=metrics)
+
 
 
 def _decode_image_from_base64(data_url: str):
@@ -376,7 +459,7 @@ def process():
     if ellipse is not None:
         # Draw ellipse
         (cx, cy), (MA, ma), angle = ellipse
-        cv2.ellipse(display, (int(cx), int(cy)), (int(MA/2), int(ma/2)), angle, 0, 360, (0,255,255), 2)
+        cv2.ellipse(display, (int(cx), int(cy)), (int(MA/2), int(ma/2)), angle, 0, 360, (0, 255, 255), 2)
 
         seg_mask, _ = segment_food_in_utensil(frame, ellipse, debug=False)
         if seg_mask is not None:
@@ -404,7 +487,7 @@ def process():
     if ellipse is None:
         txts.append("Utensil not detected")
     for i, t in enumerate(txts):
-        cv2.putText(display, t, (10, 30 + i*y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+        cv2.putText(display, t, (10, 30 + i * y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
     data_url = _encode_image_to_data_url(display)
     response = {
