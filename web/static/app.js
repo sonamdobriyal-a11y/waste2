@@ -131,9 +131,12 @@
       });
       const data = await resp.json();
       if (data.overlay) overlay.src = data.overlay;
-      const pf = data.percent_fill != null ? data.percent_fill.toFixed(1) + '%' : '—';
-      const vol = data.volume_ml != null ? data.volume_ml.toFixed(0) + ' ml' : '—';
-      stats.innerText = `Fill: ${pf}   Volume: ${vol}`;
+      const pf = data.percent_fill != null ? data.percent_fill.toFixed(1) + '%' : '--';
+      const vol = data.volume_ml != null ? data.volume_ml.toFixed(0) + ' ml' : '--';
+      const food = data.food_label
+        ? `${data.food_label}${data.food_confidence != null ? ` (${Math.round(data.food_confidence * 100)}%)` : ''}`
+        : '--';
+      stats.innerText = `Food: ${food}   Fill: ${pf}   Volume: ${vol}`;
     } catch (e) {
       console.error('process error', e);
     }
