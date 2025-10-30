@@ -2,5 +2,4 @@
 1 Onion
 2 Chilla Batter
 3 Potato
-4 Dough
-5 Nothing
+4 Nothing
