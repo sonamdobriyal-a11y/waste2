@@ -1,4 +1,0 @@
-0 Apple
-1 Potato
-2 Coriander
-3 Nothing
